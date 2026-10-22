@@ -1,0 +1,706 @@
+#!/usr/bin/env -S tcsh -f
+
+# =========================================================================
+# @StaticROIopt
+#
+# Static local ROI optimization for correspondence between a real-time
+# fMRI ROI signal and an offline-preprocessed 4-D fMRI dataset.
+#
+# Given:
+#   1. a real-time RTP time series,
+#   2. the corresponding offline 4-D fMRI dataset,
+#   3. an original ROI,
+#
+# the program searches nearby 7-mm spherical candidate ROIs and identifies
+# the candidate whose offline mean time series has the highest Pearson
+# correlation with the supplied RTP signal.
+#
+# Default search:
+#   X: -4 ... +4 mm
+#   Y: -4 ... +5 mm
+#   Z: -4 ... +4 mm
+#   810 candidates total
+#
+# The original ROI center is inferred automatically using AFNI 3dCM.
+# -center X Y Z may be supplied as an explicit override.
+#
+# Outputs:
+#   <prefix>_ROI.nii.gz
+#       optimized Static ROI
+#
+#   <prefix>_summary.tsv
+#       original and optimized correlations, ROI centers, displacement,
+#       search parameters, and correlation gain
+#
+# IMPORTANT:
+#   The optimized correlation is an in-sample optimization result.
+#   Independent data are required to assess generalization.
+# =========================================================================
+
+
+# -------------------------------------------------------------------------
+# Defaults
+# -------------------------------------------------------------------------
+
+set rtp = ""
+set input = ""
+set roi = ""
+set prefix = ""
+
+set center_set = 0
+
+set cx = 0
+set cy = 0
+set cz = 0
+
+set radius = 7
+
+
+# -------------------------------------------------------------------------
+# Parse arguments
+# -------------------------------------------------------------------------
+
+if ( $#argv == 0 ) goto SHOW_HELP
+
+
+while ( $#argv > 0 )
+
+    switch ( "$argv[1]" )
+
+        case "-help":
+        case "-h":
+            goto SHOW_HELP
+            breaksw
+
+
+        case "-rtp":
+
+            if ( $#argv < 2 ) goto BAD_ARGS
+
+            set rtp = "$argv[2]"
+
+            shift argv
+            shift argv
+
+            breaksw
+
+
+        case "-input":
+
+            if ( $#argv < 2 ) goto BAD_ARGS
+
+            set input = "$argv[2]"
+
+            shift argv
+            shift argv
+
+            breaksw
+
+
+        case "-roi":
+
+            if ( $#argv < 2 ) goto BAD_ARGS
+
+            set roi = "$argv[2]"
+
+            shift argv
+            shift argv
+
+            breaksw
+
+
+        case "-center":
+
+            if ( $#argv < 4 ) goto BAD_ARGS
+
+            set cx = "$argv[2]"
+            set cy = "$argv[3]"
+            set cz = "$argv[4]"
+
+            set center_set = 1
+
+            shift argv
+            shift argv
+            shift argv
+            shift argv
+
+            breaksw
+
+
+        case "-prefix":
+
+            if ( $#argv < 2 ) goto BAD_ARGS
+
+            set prefix = "$argv[2]"
+
+            shift argv
+            shift argv
+
+            breaksw
+
+
+        default:
+
+            echo "** ERROR: unknown option $argv[1]"
+            goto BAD_ARGS
+
+            breaksw
+
+    endsw
+
+end
+
+
+# -------------------------------------------------------------------------
+# Check required arguments
+# -------------------------------------------------------------------------
+
+if ( "$rtp" == "" ) then
+    echo "** ERROR: -rtp is required"
+    exit 1
+endif
+
+
+if ( "$input" == "" ) then
+    echo "** ERROR: -input is required"
+    exit 1
+endif
+
+
+if ( "$roi" == "" ) then
+    echo "** ERROR: -roi is required"
+    exit 1
+endif
+
+
+if ( "$prefix" == "" ) then
+    echo "** ERROR: -prefix is required"
+    exit 1
+endif
+
+
+# -------------------------------------------------------------------------
+# Check required programs
+# -------------------------------------------------------------------------
+
+foreach prog ( 3dinfo 3dcalc 3dmaskave 3dmaskdump 3dCM awk paste mktemp )
+
+    which $prog >& /dev/null
+
+    if ( $status != 0 ) then
+        echo "** ERROR: required program not found: $prog"
+        exit 1
+    endif
+
+end
+
+
+# -------------------------------------------------------------------------
+# Check inputs
+# -------------------------------------------------------------------------
+
+if ( ! -e "$rtp" ) then
+    echo "** ERROR: RTP file not found: $rtp"
+    exit 1
+endif
+
+
+3dinfo "$input" >& /dev/null
+
+if ( $status != 0 ) then
+    echo "** ERROR: input dataset could not be opened"
+    exit 1
+endif
+
+
+3dinfo "$roi" >& /dev/null
+
+if ( $status != 0 ) then
+    echo "** ERROR: original ROI could not be opened"
+    exit 1
+endif
+
+
+# -------------------------------------------------------------------------
+# Determine original ROI center
+#
+# If -center was supplied, use it.
+# Otherwise infer the ROI center of mass with AFNI 3dCM and round
+# to the nearest integer millimeter, matching the manuscript search grid.
+# -------------------------------------------------------------------------
+
+if ( $center_set == 0 ) then
+
+    set cm = ( `3dCM "$roi"` )
+
+    if ( $#cm != 3 ) then
+        echo "** ERROR: could not determine ROI center with 3dCM"
+        exit 1
+    endif
+
+    set cx = `awk -v x="$cm[1]" 'BEGIN{printf "%.0f",x}'`
+    set cy = `awk -v x="$cm[2]" 'BEGIN{printf "%.0f",x}'`
+    set cz = `awk -v x="$cm[3]" 'BEGIN{printf "%.0f",x}'`
+
+    echo "++ ROI center inferred with 3dCM: $cm[1] $cm[2] $cm[3]"
+    echo "++ Search center used:           $cx $cy $cz"
+
+else
+
+    echo "++ ROI center supplied:          $cx $cy $cz"
+
+endif
+
+
+# -------------------------------------------------------------------------
+# Number of TRs
+# -------------------------------------------------------------------------
+
+set ntrs = `3dinfo -nv "$input"`
+
+set nrtp = `wc -l < "$rtp"`
+
+
+if ( $ntrs != $nrtp ) then
+
+    echo "** ERROR: RTP length and fMRI volume count do not match"
+    echo "   RTP values:   $nrtp"
+    echo "   fMRI volumes: $ntrs"
+
+    exit 1
+
+endif
+
+
+# -------------------------------------------------------------------------
+# Temporary workspace
+# -------------------------------------------------------------------------
+
+set tmpbase = "/tmp"
+
+if ( $?TMPDIR ) then
+    set tmpbase = "$TMPDIR"
+endif
+
+
+set tmpdir = `mktemp -d "${tmpbase}/StaticROIopt.XXXXXX"`
+
+
+if ( "$tmpdir" == "" ) then
+    echo "** ERROR: could not create temporary directory"
+    exit 1
+endif
+
+
+# -------------------------------------------------------------------------
+# Extract original ROI time series
+#
+# 3dmaskave writes voxel-count messages to stderr even with -quiet.
+# Capture stdout+stderr internally, then retain only the numerical output.
+# -------------------------------------------------------------------------
+
+3dmaskave \
+    -quiet \
+    -mask "$roi" \
+    "$input" \
+    >&! "$tmpdir/original_maskave.log"
+
+set mask_status = $status
+
+if ( $mask_status != 0 ) then
+    echo "** ERROR: failed to extract original ROI signal"
+    cat "$tmpdir/original_maskave.log"
+    /bin/rm -rf "$tmpdir"
+    exit 1
+endif
+
+awk 'NF==1 && $1 ~ /^[-+]?[0-9]/ {print $1}' \
+    "$tmpdir/original_maskave.log" \
+    >! "$tmpdir/original_ts.1D"
+
+set original_nt = `wc -l < "$tmpdir/original_ts.1D"`
+
+if ( $original_nt != $ntrs ) then
+    echo "** ERROR: original ROI extraction returned $original_nt values; expected $ntrs"
+    /bin/rm -rf "$tmpdir"
+    exit 1
+endif
+
+
+# -------------------------------------------------------------------------
+# Original Pearson correlation
+# -------------------------------------------------------------------------
+
+set original_r = `paste "$rtp" "$tmpdir/original_ts.1D" | awk '{x=$1;y=$2;n++;sx+=x;sy+=y;sxx+=x*x;syy+=y*y;sxy+=x*y} END{num=n*sxy-sx*sy;den=sqrt((n*sxx-sx*sx)*(n*syy-sy*sy));if(den==0)print "NaN";else printf "%.15g\n",num/den}'`
+
+
+if ( "$original_r" == "NaN" ) then
+    echo "** ERROR: original ROI correlation is undefined"
+    /bin/rm -rf "$tmpdir"
+    exit 1
+endif
+
+
+# -------------------------------------------------------------------------
+# Cache local 4-D neighborhood once
+#
+# Candidate-center ranges:
+#   X = center -4 ... +4
+#   Y = center -4 ... +5
+#   Z = center -4 ... +4
+#
+# Each candidate is a 7-mm sphere. The extra 1-mm padding ensures that
+# the dump fully contains every voxel that could enter any candidate.
+#
+# 3dmaskdump -xyz provides RAI/DICOM coordinates, matching the coordinate
+# convention used by 3dCM and our validated 3dcalc -RAI implementation.
+# -------------------------------------------------------------------------
+
+@ xmin = $cx - 12
+@ xmax = $cx + 12
+
+@ ymin = $cy - 12
+@ ymax = $cy + 13
+
+@ zmin = $cz - 12
+@ zmax = $cz + 12
+
+set xr = "${xmin}:${xmax}"
+set yr = "${ymin}:${ymax}"
+set zr = "${zmin}:${zmax}"
+
+set local_dump = "$tmpdir/local_dump.1D"
+
+echo "++ caching local 4-D search neighborhood"
+
+3dmaskdump \
+    -quiet \
+    -noijk \
+    -xyz \
+    -dbox "$xr" "$yr" "$zr" \
+    -o "$local_dump" \
+    "$input"
+
+if ( $status != 0 ) then
+
+    echo "** ERROR: failed to cache local search neighborhood"
+
+    /bin/rm -rf "$tmpdir"
+
+    exit 1
+
+endif
+
+
+set nlocal = `wc -l < "$local_dump"`
+
+if ( $nlocal == 0 ) then
+
+    echo "** ERROR: local search neighborhood contains no voxels"
+
+    /bin/rm -rf "$tmpdir"
+
+    exit 1
+
+endif
+
+echo "++ cached $nlocal local voxels"
+
+# -------------------------------------------------------------------------
+# Static optimization
+# -------------------------------------------------------------------------
+
+set best_r = -2
+
+set best_x = 0
+set best_y = 0
+set best_z = 0
+
+set best_index = 0
+
+@ candidate = 0
+
+
+foreach dx ( -4 -3 -2 -1 0 1 2 3 4 )
+
+    foreach dy ( -4 -3 -2 -1 0 1 2 3 4 5 )
+
+        foreach dz ( -4 -3 -2 -1 0 1 2 3 4 )
+
+            @ candidate++
+
+            @ px = $cx + $dx
+            @ py = $cy + $dy
+            @ pz = $cz + $dz
+
+
+	    # -------------------------------------------------------------
+            # Candidate mean time series from cached local data
+            #
+            # This reproduces the validated manuscript sphere criterion:
+            #
+            #   step(49 - d^2)
+            #
+            # AFNI step() is zero at the boundary, so voxel centers must
+            # satisfy d^2 < 49 rather than d^2 <= 49.
+            # -------------------------------------------------------------
+
+             awk -v px="$px" -v py="$py" -v pz="$pz" -v rr="49" '{dx=$1-px;dy=$2-py;dz=$3-pz;if(dx*dx+dy*dy+dz*dz<rr){n++;last=NF;for(i=4;i<=NF;i++)s[i]+=$i}} END{if(n==0)exit 2;for(i=4;i<=last;i++)printf "%.15g\n",s[i]/n}' "$local_dump" >! "$tmpdir/candidate_ts.1D"
+
+
+            if ( $status != 0 ) then
+
+                echo "** ERROR: failed to evaluate candidate $candidate"
+
+                /bin/rm -rf "$tmpdir"
+
+                exit 1
+
+            endif
+
+
+            set candidate_nt = `wc -l < "$tmpdir/candidate_ts.1D"`
+
+            if ( $candidate_nt != $ntrs ) then
+
+                echo "** ERROR: candidate $candidate returned $candidate_nt values; expected $ntrs"
+
+                /bin/rm -rf "$tmpdir"
+
+                exit 1
+
+            endif
+
+
+            # -------------------------------------------------------------
+            # Pearson correlation
+            # -------------------------------------------------------------
+
+            set this_r = `paste "$rtp" "$tmpdir/candidate_ts.1D" | awk '{x=$1;y=$2;n++;sx+=x;sy+=y;sxx+=x*x;syy+=y*y;sxy+=x*y} END{num=n*sxy-sx*sy;den=sqrt((n*sxx-sx*sx)*(n*syy-sy*sy));if(den==0)print "NaN";else printf "%.15g\n",num/den}'`
+
+
+            if ( "$this_r" != "NaN" ) then
+
+                set better = `awk -v a="$this_r" -v b="$best_r" 'BEGIN{if(a>b)print 1;else print 0}'`
+
+
+                if ( $better == 1 ) then
+
+                    set best_r = "$this_r"
+
+                    set best_x = $px
+                    set best_y = $py
+                    set best_z = $pz
+
+                    set best_index = $candidate
+
+                endif
+
+            endif
+
+
+            @ mod100 = $candidate % 100
+
+            if ( $mod100 == 0 ) then
+                echo "++ evaluated $candidate / 810 candidates"
+            endif
+
+
+        end
+
+    end
+
+end
+
+
+if ( $candidate != 810 ) then
+
+    echo "** ERROR: expected 810 candidates, evaluated $candidate"
+
+    /bin/rm -rf "$tmpdir"
+
+    exit 1
+
+endif
+
+
+# -------------------------------------------------------------------------
+# Create final winning ROI
+# -------------------------------------------------------------------------
+
+set best_expr = "1*step(${radius}*${radius}-(x-${best_x})*(x-${best_x})-(y-${best_y})*(y-${best_y})-(z-${best_z})*(z-${best_z}))"
+
+
+3dcalc \
+    -RAI \
+    -overwrite \
+    -a "$roi" \
+    -expr "$best_expr" \
+    -prefix "${prefix}_ROI.nii.gz" \
+    >& /dev/null
+
+
+if ( $status != 0 ) then
+
+    echo "** ERROR: failed to write winning ROI"
+
+    /bin/rm -rf "$tmpdir"
+
+    exit 1
+
+endif
+
+
+# -------------------------------------------------------------------------
+# Displacement and gain
+# -------------------------------------------------------------------------
+
+@ shift_x = $best_x - $cx
+@ shift_y = $best_y - $cy
+@ shift_z = $best_z - $cz
+
+
+set displacement = `awk -v x="$shift_x" -v y="$shift_y" -v z="$shift_z" 'BEGIN{printf "%.9f\n",sqrt(x*x+y*y+z*z)}'`
+
+
+set gain_r = `awk -v x="$best_r" -v y="$original_r" 'BEGIN{printf "%.15g\n",x-y}'`
+
+
+# -------------------------------------------------------------------------
+# Summary file
+# -------------------------------------------------------------------------
+
+set summary = "${prefix}_summary.tsv"
+
+
+echo "metric	value" >! "$summary"
+
+echo "n_trs	$ntrs" >> "$summary"
+
+echo "n_candidates	$candidate" >> "$summary"
+
+echo "sphere_radius_mm	$radius" >> "$summary"
+
+echo "original_center_x	$cx" >> "$summary"
+echo "original_center_y	$cy" >> "$summary"
+echo "original_center_z	$cz" >> "$summary"
+
+echo "winning_center_x	$best_x" >> "$summary"
+echo "winning_center_y	$best_y" >> "$summary"
+echo "winning_center_z	$best_z" >> "$summary"
+
+echo "shift_x_mm	$shift_x" >> "$summary"
+echo "shift_y_mm	$shift_y" >> "$summary"
+echo "shift_z_mm	$shift_z" >> "$summary"
+
+echo "displacement_mm	$displacement" >> "$summary"
+
+echo "candidate_loop_index	$best_index" >> "$summary"
+
+echo "original_r	$original_r" >> "$summary"
+echo "optimized_r	$best_r" >> "$summary"
+echo "gain_r	$gain_r" >> "$summary"
+
+echo "optimized_roi	${prefix}_ROI.nii.gz" >> "$summary"
+
+
+# -------------------------------------------------------------------------
+# Terminal report
+# -------------------------------------------------------------------------
+
+echo ""
+echo "============================================================"
+echo "STATIC ROI OPTIMIZATION COMPLETE"
+echo "============================================================"
+
+echo "TRs:                    $ntrs"
+echo "Candidates evaluated:   $candidate"
+
+echo ""
+
+echo "Original center:        $cx $cy $cz"
+echo "Winning center:         $best_x $best_y $best_z"
+echo "Winning shift:          $shift_x $shift_y $shift_z"
+echo "Displacement (mm):      $displacement"
+
+echo ""
+
+echo "Original correlation:   $original_r"
+echo "Optimized correlation:  $best_r"
+echo "Correlation gain:       $gain_r"
+
+echo ""
+
+echo "Optimized ROI:          ${prefix}_ROI.nii.gz"
+echo "Summary:                $summary"
+
+echo "============================================================"
+
+echo ""
+echo "NOTE: optimized r is an in-sample value."
+echo ""
+
+
+/bin/rm -rf "$tmpdir"
+
+exit 0
+
+
+# -------------------------------------------------------------------------
+# Help
+# -------------------------------------------------------------------------
+
+SHOW_HELP:
+
+echo ""
+echo "@StaticROIopt"
+echo ""
+echo "Static local ROI optimization using RTP-to-offline fMRI correspondence."
+echo ""
+echo "USAGE"
+echo ""
+echo "  @StaticROIopt \\"
+echo "      -rtp RTP_SIGNAL.1D \\"
+echo "      -input OFFLINE_4D_DATASET \\"
+echo "      -roi ORIGINAL_ROI \\"
+echo "      -prefix OUTPUT_PREFIX"
+echo ""
+echo "REQUIRED OPTIONS"
+echo ""
+echo "  -rtp FILE"
+echo "      One-column real-time RTP signal."
+echo ""
+echo "  -input DSET"
+echo "      Corresponding offline-preprocessed 4-D AFNI/NIfTI dataset."
+echo ""
+echo "  -roi DSET"
+echo "      Original ROI mask."
+echo ""
+echo "  -prefix PREFIX"
+echo "      Prefix for optimized ROI and summary output."
+echo ""
+echo "OPTIONAL"
+echo ""
+echo "  -center X Y Z"
+echo "      Override the ROI center inferred automatically with AFNI 3dCM."
+echo ""
+echo "OUTPUTS"
+echo ""
+echo "  PREFIX_ROI.nii.gz"
+echo "  PREFIX_summary.tsv"
+echo ""
+echo "DEFAULT SEARCH"
+echo ""
+echo "  7-mm spherical candidates"
+echo "  X offsets: -4 ... +4 mm"
+echo "  Y offsets: -4 ... +5 mm"
+echo "  Z offsets: -4 ... +4 mm"
+echo "  810 candidates"
+echo ""
+echo "NOTE"
+echo ""
+echo "  The optimized correlation is an in-sample value."
+echo "  Independent data should be used to evaluate generalization."
+echo ""
+
+exit 0
